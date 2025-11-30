@@ -4,17 +4,24 @@ import pandas as pd
 from joblib import load
 import json
 import numpy as np
+import os
 
 app = Flask(__name__)
 
 # -------------------------
+# Set base directory
+# -------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# -------------------------
 # Load artifacts
 # -------------------------
-xgb_model = load("xgb_model.joblib")
-mlb_problems = load("mlb_problems.joblib")
-mlb_services = load("mlb_services.joblib")
-le = load("label_encoder.joblib")
-with open("feature_columns.json") as f:
+xgb_model = load(os.path.join(BASE_DIR, "xgb_model.joblib"))
+mlb_problems = load(os.path.join(BASE_DIR, "mlb_problems.joblib"))
+mlb_services = load(os.path.join(BASE_DIR, "mlb_services.joblib"))
+le = load(os.path.join(BASE_DIR, "label_encoder.joblib"))
+
+with open(os.path.join(BASE_DIR, "feature_columns.json")) as f:
     feature_columns = json.load(f)
 
 
@@ -74,12 +81,12 @@ def predict_risk():
         results.append({
             "input": record,
             "predicted": str(preds[i]),
-            "xgboost": sorted_prob_dict  # <-- key PHP expects
+            "xgboost": sorted_prob_dict
         })
 
     return jsonify(results)
 
 
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
