@@ -1,0 +1,51 @@
+include 'includes/db.php';
+
+$suggestionsMap = [
+"love life" => "Guidance/Counseling",
+"bullying" => "Guidance/Counseling",
+"substance abuse" => "Rehabilitation",
+"mental health" => "Guidance/Counseling",
+"violence (vawc)" => "Rehabilitation",
+"too early sexual activity" => "Reproductive Health (incl. Family Planning)",
+"family problem" => "Guidance/Counseling",
+"peer pressure" => "Information/Education",
+"school works" => "Support for education/technical skills",
+"medical/dental" => "Medical/Dental",
+"spiritual emptiness" => "Spiritual Formation"
+];
+
+try {
+$query = "
+SELECT
+a.*,
+s.name AS school_name
+FROM assessment a
+LEFT JOIN school s ON a.school_id = s.school_id
+ORDER BY a.created_at DESC
+";
+
+$stmt = $pdo->query($query);
+$results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+foreach ($results as $row) {
+$badgeColor = match ($row['risk_category']) {
+'High Risk' => 'bg-danger',
+'Medium Risk' => 'bg-warning',
+'Low Risk' => 'bg-success',
+default => 'bg-secondary',
+};
+
+echo "<tr>
+    <td>" . htmlspecialchars(date('Y-m-d', strtotime($row['created_at']))) . "</td>
+    <td>" . htmlspecialchars($row['name']) . "</td>
+    <td>" . htmlspecialchars($row['age']) . "</td>
+    <td>" . htmlspecialchars($row['school_name']) . "</td>
+    <td><span class='badge {$badgeColor}'>{$row['risk_category']}</span></td>
+    <td>" . htmlspecialchars($row['desired_service'] ?? 'Not Specified') . "</td>
+</tr>";
+}
+} catch (PDOException $e) {
+echo "<tr>
+    <td colspan='6'>Error: " . $e->getMessage() . "</td>
+</tr>";
+}

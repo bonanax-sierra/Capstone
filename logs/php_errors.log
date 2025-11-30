@@ -1,0 +1,5 @@
+[22-Sep-2025 01:13:06 Asia/Manila] PHP Fatal error:  Cannot declare class Database, because the name is already in use in C:\xampp\htdocs\Capstone_9-05_python\includes\db.php on line 12
+[22-Sep-2025 01:14:03 Asia/Manila] PHP Fatal error:  Cannot declare class Database, because the name is already in use in C:\xampp\htdocs\Capstone_9-05_python\includes\db.php on line 12
+[22-Sep-2025 01:14:04 Asia/Manila] PHP Fatal error:  Cannot declare class Database, because the name is already in use in C:\xampp\htdocs\Capstone_9-05_python\includes\db.php on line 12
+[22-Sep-2025 01:17:11 Asia/Manila] PHP Fatal error:  Cannot declare class Database, because the name is already in use in C:\xampp\htdocs\Capstone_9-05_python\includes\db.php on line 12
+[22-Sep-2025 01:17:12 Asia/Manila] PHP Fatal error:  Cannot declare class Database, because the name is already in use in C:\xampp\htdocs\Capstone_9-05_python\includes\db.php on line 12

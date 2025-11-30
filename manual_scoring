@@ -1,0 +1,631 @@
+<?php
+session_start();
+require '../vendor/autoload.php'; // PhpSpreadsheet
+include 'db.php'; // PDO connection
+
+use PhpOffice\PhpSpreadsheet\IOFactory;
+
+// -------------------------
+// Call XGBoost API for batch risk prediction
+// -------------------------
+function predictRiskBatch($batchData) {
+    $apiUrl = "http://localhost:5000/predict_risk_batch";
+
+    $ch = curl_init($apiUrl);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($batchData));
+
+    $response = curl_exec($ch);
+    if (curl_errno($ch)) {
+        curl_close($ch);
+        return [];
+    }
+    curl_close($ch);
+
+    $result = json_decode($response, true);
+    return $result['predictions'] ?? [];
+}
+
+try {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_FILES['excel_file']['tmp_name'])) {
+        $filePath = $_FILES['excel_file']['tmp_name'];
+        $spreadsheet = IOFactory::load($filePath);
+        $worksheet = $spreadsheet->getActiveSheet();
+        $rows = $worksheet->toArray();
+
+        $allValues = [];
+        $batchData = [];
+        $activityMap = [];
+
+        // -------------------------
+        // Helper: get cell by header name
+        // -------------------------
+        $headers = array_map('trim', $rows[0]);
+        $hx = array_flip($headers);
+
+        function cell($row, $hx, $col) {
+            return isset($hx[$col]) ? trim($row[$hx[$col]] ?? '') : null;
+        }
+
+        // -------------------------
+        // Loop rows (skip header)
+        // -------------------------
+        for ($i = 1; $i < count($rows); $i++) {
+            $row = $rows[$i];
+
+            // -------------------------
+            // Activity info
+            // -------------------------
+            $municipality     = cell($row, $hx, 'Municipality');
+            $barangay         = cell($row, $hx, 'Barangay');
+            $activity_title   = cell($row, $hx, 'Activity Title');
+            $activity_type    = cell($row, $hx, 'Activity Type');
+            $date_of_activity = cell($row, $hx, 'Date of Activity');
+            $date_of_activity = !empty($date_of_activity) ? date('Y-m-d', strtotime($date_of_activity)) : null;
+            $activityKey      = md5($activity_title . $barangay . $date_of_activity);
+
+            if (!empty($activity_title) && !empty($barangay) && !empty($date_of_activity)) {
+                if (isset($activityMap[$activityKey])) {
+                    $activity_id = $activityMap[$activityKey];
+                } else {
+                    $stmt = $pdo->prepare("SELECT activity_id FROM activity_info WHERE activity_title = ? AND barangay = ? AND date_of_activity = ?");
+                    $stmt->execute([$activity_title, $barangay, $date_of_activity]);
+                    $activity = $stmt->fetch(PDO::FETCH_ASSOC);
+
+                    if ($activity) {
+                        $activity_id = $activity['activity_id'];
+                    } else {
+                        $stmt = $pdo->prepare("INSERT INTO activity_info (municipality, barangay, activity_title, activity_type, date_of_activity, status) VALUES (?, ?, ?, ?, ?, 'active')");
+                        $stmt->execute([$municipality, $barangay, $activity_title, $activity_type, $date_of_activity]);
+                        $activity_id = $pdo->lastInsertId();
+                    }
+
+                    $activityMap[$activityKey] = $activity_id;
+                }
+            } else {
+                $activity_id = null;
+            }
+
+            // -------------------------
+            // Personal & assessment info
+            // -------------------------
+            $first_name     = cell($row, $hx, 'First Name');
+            $middle_name    = cell($row, $hx, 'Middle Name');
+            $last_name      = cell($row, $hx, 'Last Name');
+            $extension_name = cell($row, $hx, 'Extension Name');
+            $sex            = cell($row, $hx, 'Sex');
+            $date_of_birth  = cell($row, $hx, 'Date of Birth');
+            $date_of_birth  = !empty($date_of_birth) ? date('Y-m-d', strtotime($date_of_birth)) : null;
+            $civil_status   = cell($row, $hx, 'Civil Status');
+            $school_status  = cell($row, $hx, 'School Status');
+            $highest_educ   = cell($row, $hx, 'Highest Educational Attainment');
+            $email          = cell($row, $hx, 'Email');
+
+            // JSON-safe fields
+            $current_problems = cell($row, $hx, 'Current Problems');
+            $current_problems = $current_problems
+                ? json_encode(array_map('trim', explode(',', $current_problems)), JSON_UNESCAPED_UNICODE)
+                : json_encode([]);
+
+            $desired_services = cell($row, $hx, 'Desired Services');
+            $desired_services = $desired_services
+                ? json_encode(array_map('trim', explode(',', $desired_services)), JSON_UNESCAPED_UNICODE)
+                : json_encode([]);
+
+            $pregnant        = cell($row, $hx, 'Have you ever been pregnant?') ?: 'N/A';
+            $family_planning = cell($row, $hx, 'Are you currently using any Family Planning method?');
+            $impregnated     = cell($row, $hx, 'Have you impregnated someone?') ?: 'N/A';
+            $mobile_access   = cell($row, $hx, 'Mobile Accessibility') ?: 'No';
+            $mobile_number   = cell($row, $hx, 'Mobile Number');
+            $mobile_type     = cell($row, $hx, 'Mobile Phone Type') ?: 'Unknown';
+
+            // Age
+            $age = !empty($date_of_birth) ? (int)date_diff(date_create($date_of_birth), date_create('today'))->y : 0;
+
+            // -------------------------
+            // Batch data for ML API
+            // -------------------------
+            $batchData[] = [
+                "age" => $age,
+                "gender" => $sex,
+                "civil_status" => $civil_status,
+                "school_status" => $school_status,
+                "highest_educational_attainment" => $highest_educ,
+                "problems" => json_decode($current_problems, true),
+                "desired_service" => json_decode($desired_services, true),
+                "pregnant" => $pregnant,
+                "pregnant_age" => null,
+                "mobile_use" => $mobile_access,
+                "school_id" => 0
+            ];
+
+            // -------------------------
+            // Collect values for DB insert
+            // -------------------------
+            $allValues[] = [
+                $first_name, $middle_name, $last_name, $extension_name, $sex,
+                $date_of_birth, $civil_status, $school_status, $highest_educ, $email,
+                $current_problems, $desired_services, $pregnant, $family_planning, $impregnated,
+                $mobile_access, $mobile_number, $mobile_type,
+                null, // risk_category
+                null, // risk_category_random_forest
+                null, // risk_category_ann
+                null, // risk_category_xgboost
+                null, // school_id (not mapped from Excel here)
+                $activity_id
+            ];
+        }
+
+        // -------------------------
+        // Call XGBoost API
+        // -------------------------
+        $predictions = predictRiskBatch($batchData);
+
+        // -------------------------
+        // Update risk_category fields
+        // -------------------------
+        foreach ($allValues as $i => $rowValues) {
+            $rowValues[18] = $predictions[$i] ?? 'Low'; // risk_category
+            $rowValues[21] = $predictions[$i] ?? 'Low'; // risk_category_xgboost
+            $allValues[$i] = $rowValues;
+        }
+
+        // -------------------------
+        // Bulk insert
+        // -------------------------
+        if (!empty($allValues)) {
+            $flatValues = [];
+            foreach ($allValues as $row) {
+                foreach ($row as $v) $flatValues[] = $v;
+            }
+
+            $placeholders = array_fill(0, count($allValues), "(" . implode(",", array_fill(0, 24, "?")) . ")");
+            $sql = "
+                INSERT INTO assessment (
+                    first_name, middle_name, last_name, extension_name, sex,
+                    date_of_birth, civil_status, school_status, highest_educational_attainment, email,
+                    current_problems, desired_services, pregnant, family_planning_method, impregnated_someone,
+                    mobile_accessibility, mobile_number, mobile_phone_type,
+                    risk_category, risk_category_random_forest, risk_category_ann, risk_category_xgboost,
+                    school_id, activity_id
+                ) VALUES " . implode(",", $placeholders);
+
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($flatValues);
+
+            $_SESSION['success'] = "Excel data imported and risk predicted successfully!";
+        } else {
+            $_SESSION['error'] = "No valid rows found in Excel.";
+        }
+    } else {
+        $_SESSION['error'] = "Please upload an Excel file.";
+    }
+} catch (Exception $e) {
+    $_SESSION['error'] = "Error importing file: " . $e->getMessage();
+}
+
+header("Location: ../activity_management.php");
+exit;
+
+
+<?php
+session_start();
+require '../vendor/autoload.php'; // PhpSpreadsheet
+include 'db.php'; // PDO connection
+
+use PhpOffice\PhpSpreadsheet\IOFactory;
+
+// -------------------------
+// Risk scoring function
+// -------------------------
+function calculateRiskCategory($age, $school_status, $issues, $pregnant, $impregnated) {
+    $score = 0;
+
+    // 1. School status: dropout is a strong risk marker
+    if (strtolower($school_status) === "out of school youth") {
+        $score += 3; // evidence shows dropouts have higher suicide attempt and substance use rates :contentReference[oaicite:6]{index=6}
+    }
+
+    // 2. Problems/Issues based on domains:
+    foreach ($issues as $issue) {
+        $iss = strtolower(trim($issue));
+        switch ($iss) {
+            case "substance abuse":
+            case "too early sexual activity":
+            case "violence (vawc)":
+                $score += 3; // high all-domain risk :contentReference[oaicite:7]{index=7}
+                break;
+
+            case "mental health":
+            case "peer pressure":
+            case "family problem":
+                $score += 2; // moderate sustained risk
+                break;
+
+            case "bullying":
+            case "school works":
+            case "love life":
+            case "medical/dental":
+            case "spiritual emptiness":
+                $score += 1; // low but relevant stressors
+                break;
+
+            case "others":
+                $score += 2; // moderate default
+                break;
+        }
+    }
+
+    // 3. Reproductive health
+    if (strtolower($pregnant) === "yes")     $score += 3;
+    if (strtolower($impregnated) === "yes")  $score += 3;
+
+    // 4. Age-related vulnerability (optional, lower weight)
+    if ($age <= 15)      $score += 1;
+    elseif ($age <= 19)  $score += 1;
+
+    // 5. Map score to category using SRSS-inspired ranges
+    if ($score >= 7)      return "High";   // high cumulative, crisis-level
+    elseif ($score >= 4)  return "Medium"; // notable risk needing follow-up
+    else                  return "Low";    // baseline or minimal
+}
+
+
+try {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_FILES['excel_file']['tmp_name'])) {
+        $filePath = $_FILES['excel_file']['tmp_name'];
+        $spreadsheet = IOFactory::load($filePath);
+        $worksheet = $spreadsheet->getActiveSheet();
+        $rows = $worksheet->toArray();
+
+        $allValues = [];
+        $activityMap = [];
+
+        // Headers
+        $headers = array_map('trim', $rows[0]);
+        $hx = array_flip($headers);
+
+        function cell($row, $hx, $col)
+        {
+            return isset($hx[$col]) ? trim($row[$hx[$col]] ?? '') : null;
+        }
+
+        // Loop rows (skip header)
+        for ($i = 1; $i < count($rows); $i++) {
+            $row = $rows[$i];
+
+            // Activity info
+            $municipality     = cell($row, $hx, 'Municipality');
+            $barangay         = cell($row, $hx, 'Barangay');
+            $activity_title   = cell($row, $hx, 'Activity Title');
+            $activity_type    = cell($row, $hx, 'Activity Type');
+            $date_of_activity = cell($row, $hx, 'Date of Activity');
+            $date_of_activity = !empty($date_of_activity) ? date('Y-m-d', strtotime($date_of_activity)) : null;
+            $activityKey      = md5($activity_title . $barangay . $date_of_activity);
+
+            if (!empty($activity_title) && !empty($barangay) && !empty($date_of_activity)) {
+                if (isset($activityMap[$activityKey])) {
+                    $activity_id = $activityMap[$activityKey];
+                } else {
+                    $stmt = $pdo->prepare("SELECT activity_id FROM activity_info WHERE activity_title = ? AND barangay = ? AND date_of_activity = ?");
+                    $stmt->execute([$activity_title, $barangay, $date_of_activity]);
+                    $activity = $stmt->fetch(PDO::FETCH_ASSOC);
+
+                    if ($activity) {
+                        $activity_id = $activity['activity_id'];
+                    } else {
+                        $stmt = $pdo->prepare("INSERT INTO activity_info (municipality, barangay, activity_title, activity_type, date_of_activity, status) VALUES (?, ?, ?, ?, ?, 'active')");
+                        $stmt->execute([$municipality, $barangay, $activity_title, $activity_type, $date_of_activity]);
+                        $activity_id = $pdo->lastInsertId();
+                    }
+
+                    $activityMap[$activityKey] = $activity_id;
+                }
+            } else {
+                $activity_id = null;
+            }
+
+            // Personal info
+            $first_name     = cell($row, $hx, 'First Name');
+            $middle_name    = cell($row, $hx, 'Middle Name');
+            $last_name      = cell($row, $hx, 'Last Name');
+            $extension_name = cell($row, $hx, 'Extension Name');
+            $sex            = cell($row, $hx, 'Sex');
+            $date_of_birth  = cell($row, $hx, 'Date of Birth');
+            $date_of_birth  = !empty($date_of_birth) ? date('Y-m-d', strtotime($date_of_birth)) : null;
+            $civil_status   = cell($row, $hx, 'Civil Status');
+            $school_status  = cell($row, $hx, 'School Status');
+            $highest_educ   = cell($row, $hx, 'Highest Educational Attainment');
+            $email          = cell($row, $hx, 'Email');
+
+            // JSON fields
+            $current_problems = cell($row, $hx, 'Current Problems');
+            $problemsArray = $current_problems ? array_map('trim', explode(',', $current_problems)) : [];
+            $current_problems_json = json_encode($problemsArray, JSON_UNESCAPED_UNICODE);
+
+            $desired_services = cell($row, $hx, 'Desired Services');
+            $desired_services = $desired_services
+                ? json_encode(array_map('trim', explode(',', $desired_services)), JSON_UNESCAPED_UNICODE)
+                : json_encode([]);
+
+            $pregnant        = cell($row, $hx, 'Have you ever been pregnant?') ?: 'N/A';
+            $family_planning = cell($row, $hx, 'Are you currently using any Family Planning method?');
+            $impregnated     = cell($row, $hx, 'Have you impregnated someone?') ?: 'N/A';
+            $mobile_access   = cell($row, $hx, 'Mobile Accessibility') ?: 'No';
+            $mobile_number   = cell($row, $hx, 'Mobile Number');
+            $mobile_type     = cell($row, $hx, 'Mobile Phone Type') ?: 'Unknown';
+
+            // Age calculation
+            $age = !empty($date_of_birth) ? (int)date_diff(date_create($date_of_birth), date_create('today'))->y : 0;
+
+            // -------------------------
+            // Risk Category (Manual)
+            // -------------------------
+            $risk_category = calculateRiskCategory($age, $school_status, $problemsArray, $pregnant, $impregnated);
+
+            // Collect values
+            $allValues[] = [
+                $first_name,
+                $middle_name,
+                $last_name,
+                $extension_name,
+                $sex,
+                $date_of_birth,
+                $civil_status,
+                $school_status,
+                $highest_educ,
+                $email,
+                $current_problems_json,
+                $desired_services,
+                $pregnant,
+                $family_planning,
+                $impregnated,
+                $mobile_access,
+                $mobile_number,
+                $mobile_type,
+                $risk_category, // risk_category
+                null,           // risk_category_random_forest
+                null,           // risk_category_ann
+                $risk_category, // risk_category_xgboost (just duplicate for now)
+                null,           // school_id (not mapped)
+                $activity_id
+            ];
+        }
+
+        // Bulk insert
+        if (!empty($allValues)) {
+            $flatValues = [];
+            foreach ($allValues as $row) {
+                foreach ($row as $v) $flatValues[] = $v;
+            }
+
+            $placeholders = array_fill(0, count($allValues), "(" . implode(",", array_fill(0, 24, "?")) . ")");
+            $sql = "
+                INSERT INTO assessment (
+                    first_name, middle_name, last_name, extension_name, sex,
+                    date_of_birth, civil_status, school_status, highest_educational_attainment, email,
+                    current_problems, desired_services, pregnant, family_planning_method, impregnated_someone,
+                    mobile_accessibility, mobile_number, mobile_phone_type,
+                    risk_category, risk_category_random_forest, risk_category_ann, risk_category_xgboost,
+                    school_id, activity_id
+                ) VALUES " . implode(",", $placeholders);
+
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($flatValues);
+
+            $_SESSION['success'] = "Excel data imported with calculated risk scores successfully!";
+        } else {
+            $_SESSION['error'] = "No valid rows found in Excel.";
+        }
+    } else {
+        $_SESSION['error'] = "Please upload an Excel file.";
+    }
+} catch (Exception $e) {
+    $_SESSION['error'] = "Error importing file: " . $e->getMessage();
+}
+
+header("Location: ../activity_management.php");
+exit;
+
+
+<?php
+session_start();
+require '../vendor/autoload.php'; // PhpSpreadsheet
+include 'db.php'; // PDO connection
+
+use PhpOffice\PhpSpreadsheet\IOFactory;
+
+// -------------------------
+// Call XGBoost API for batch risk prediction
+// -------------------------
+function predictRiskBatch($batchData) {
+    $apiUrl = "http://localhost:5000/predict_risk_batch";
+
+    $ch = curl_init($apiUrl);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($batchData));
+
+    $response = curl_exec($ch);
+    if (curl_errno($ch)) {
+        curl_close($ch);
+        return [];
+    }
+    curl_close($ch);
+
+    $result = json_decode($response, true);
+    return $result['predictions'] ?? [];
+}
+
+try {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_FILES['excel_file']['tmp_name'])) {
+        $filePath = $_FILES['excel_file']['tmp_name'];
+        $spreadsheet = IOFactory::load($filePath);
+        $worksheet = $spreadsheet->getActiveSheet();
+        $rows = $worksheet->toArray();
+
+        $allValues = [];
+        $batchData = [];
+        $activityMap = [];
+
+        $headers = array_map('trim', $rows[0]);
+        $hx = array_flip($headers);
+
+        function cell($row, $hx, $col, $default = null) {
+            return isset($hx[$col]) ? trim($row[$hx[$col]] ?? $default) : $default;
+        }
+
+        for ($i = 1; $i < count($rows); $i++) {
+            $row = $rows[$i];
+
+            // Activity info
+            $municipality     = cell($row, $hx, 'Municipality', '');
+            $barangay         = cell($row, $hx, 'Barangay', '');
+            $activity_title   = cell($row, $hx, 'Activity Title', '');
+            $activity_type    = cell($row, $hx, 'Activity Type', '');
+            $date_of_activity = cell($row, $hx, 'Date of Activity', '');
+            $date_of_activity = !empty($date_of_activity) ? date('Y-m-d', strtotime($date_of_activity)) : null;
+            $activityKey      = md5($activity_title . $barangay . $date_of_activity);
+
+            if (!empty($activity_title) && !empty($barangay) && !empty($date_of_activity)) {
+                if (isset($activityMap[$activityKey])) {
+                    $activity_id = $activityMap[$activityKey];
+                } else {
+                    $stmt = $pdo->prepare("SELECT activity_id FROM activity_info WHERE activity_title = ? AND barangay = ? AND date_of_activity = ?");
+                    $stmt->execute([$activity_title, $barangay, $date_of_activity]);
+                    $activity = $stmt->fetch(PDO::FETCH_ASSOC);
+
+                    if ($activity) {
+                        $activity_id = $activity['activity_id'];
+                    } else {
+                        $stmt = $pdo->prepare("INSERT INTO activity_info (municipality, barangay, activity_title, activity_type, date_of_activity, status) VALUES (?, ?, ?, ?, ?, 'active')");
+                        $stmt->execute([$municipality, $barangay, $activity_title, $activity_type, $date_of_activity]);
+                        $activity_id = $pdo->lastInsertId();
+                    }
+
+                    $activityMap[$activityKey] = $activity_id;
+                }
+            } else {
+                $activity_id = null;
+            }
+
+            // Personal & assessment info with safe defaults
+            $first_name     = cell($row, $hx, 'First Name', '');
+            $middle_name    = cell($row, $hx, 'Middle Name', '');
+            $last_name      = cell($row, $hx, 'Last Name', '');
+            $extension_name = cell($row, $hx, 'Extension Name', '');
+            $sex            = cell($row, $hx, 'Sex', 'Other');
+            $date_of_birth  = cell($row, $hx, 'Date of Birth', null);
+            $date_of_birth  = !empty($date_of_birth) ? date('Y-m-d', strtotime($date_of_birth)) : null;
+            $civil_status   = cell($row, $hx, 'Civil Status', 'Other');
+            $school_status  = cell($row, $hx, 'School Status', 'Out of School Youth');
+            $highest_educ   = cell($row, $hx, 'Highest Educational Attainment', '');
+            $email          = cell($row, $hx, 'Email', '');
+
+            // JSON-safe fields
+            $current_problems = cell($row, $hx, 'Current Problems', '');
+            $current_problems = $current_problems
+                ? json_encode(array_map('trim', explode(',', $current_problems)), JSON_UNESCAPED_UNICODE)
+                : json_encode([]);
+
+            $desired_services = cell($row, $hx, 'Desired Services', '');
+            $desired_services = $desired_services
+                ? json_encode(array_map('trim', explode(',', $desired_services)), JSON_UNESCAPED_UNICODE)
+                : json_encode([]);
+
+            $pregnant        = cell($row, $hx, 'Have you ever been pregnant?', 'N/A');
+            $family_planning = cell($row, $hx, 'Are you currently using any Family Planning method?', null);
+            $impregnated     = cell($row, $hx, 'Have you impregnated someone?', 'N/A');
+            $mobile_access   = cell($row, $hx, 'Mobile Accessibility', 'No');
+            $mobile_number   = cell($row, $hx, 'Mobile Number', null);
+            $mobile_type     = cell($row, $hx, 'Mobile Phone Type', 'Unknown');
+
+            // Optional fields with defaults
+            $employment_status = cell($row, $hx, 'Employment Status', null);
+            $grade_level       = cell($row, $hx, 'Grade Level', null);
+            $pregnant_age      = cell($row, $hx, 'Pregnancy Age', null);
+            $address           = cell($row, $hx, 'Address', null);
+
+            // Age calculation (optional)
+            $age = !empty($date_of_birth) ? (int)date_diff(date_create($date_of_birth), date_create('today'))->y : 0;
+
+            // Batch data for ML
+            $batchData[] = [
+                "age" => $age,
+                "gender" => $sex,
+                "civil_status" => $civil_status,
+                "employment_status" => $employment_status,
+                "school_status" => $school_status,
+                "grade_level" => $grade_level,
+                "highest_educational_attainment" => $highest_educ,
+                "problems" => json_decode($current_problems, true),
+                "desired_service" => json_decode($desired_services, true),
+                "pregnant" => $pregnant,
+                "pregnant_age" => $pregnant_age,
+                "mobile_use" => $mobile_access,
+                "school_id" => 0
+            ];
+
+            // DB insert values
+            $allValues[] = [
+                $first_name, $middle_name, $last_name, $extension_name, $sex,
+                $date_of_birth, $civil_status, $school_status, $highest_educ, $email,
+                $current_problems, $desired_services, $pregnant, $family_planning, $impregnated,
+                $mobile_access, $mobile_number, $mobile_type,
+                null, null, null, null, // risk categories
+                $school_id ?? null, $activity_id,
+                $employment_status, $grade_level, $pregnant_age, $address
+            ];
+        }
+
+        // Call XGBoost API
+        $predictions = predictRiskBatch($batchData);
+
+        // Update risk_category fields
+        foreach ($allValues as $i => $rowValues) {
+            $rowValues[18] = $predictions[$i] ?? 'Low'; // risk_category
+            $rowValues[21] = $predictions[$i] ?? 'Low'; // risk_category_xgboost
+            $allValues[$i] = $rowValues;
+        }
+
+        // Bulk insert
+        if (!empty($allValues)) {
+            $flatValues = [];
+            foreach ($allValues as $row) {
+                foreach ($row as $v) $flatValues[] = $v;
+            }
+
+            $placeholders = array_fill(0, count($allValues), "(" . implode(",", array_fill(0, count($allValues[0]), "?")) . ")");
+            $sql = "
+                INSERT INTO assessment (
+                    first_name, middle_name, last_name, extension_name, sex,
+                    date_of_birth, civil_status, school_status, highest_educational_attainment, email,
+                    current_problems, desired_service, pregnant, family_planning_method, impregnated_someone,
+                    mobile_accessibility, mobile_number, mobile_phone_type,
+                    risk_category, risk_category_random_forest, risk_category_ann, risk_category_xgboost,
+                    school_id, activity_id,
+                    employment_status, grade_level, pregnant_age, address
+                ) VALUES " . implode(",", $placeholders);
+
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($flatValues);
+
+            $_SESSION['success'] = "Excel data imported and risk predicted successfully!";
+        } else {
+            $_SESSION['error'] = "No valid rows found in Excel.";
+        }
+    } else {
+        $_SESSION['error'] = "Please upload an Excel file.";
+    }
+} catch (Exception $e) {
+    $_SESSION['error'] = "Error importing file: " . $e->getMessage();
+}
+
+header("Location: ../activity_management.php");
+exit;
+?>
+
+
